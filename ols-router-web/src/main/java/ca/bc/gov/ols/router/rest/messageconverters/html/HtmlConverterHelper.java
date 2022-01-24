@@ -11,7 +11,6 @@ import java.util.List;
 import org.apache.commons.lang3.StringEscapeUtils;
 
 import ca.bc.gov.ols.router.Router;
-import ca.bc.gov.ols.router.RouterConfig;
 import ca.bc.gov.ols.router.api.ApiResponse;
 import ca.bc.gov.ols.router.api.IsochroneResponse;
 import ca.bc.gov.ols.router.api.RouterDirectionsResponse;
@@ -19,13 +18,15 @@ import ca.bc.gov.ols.router.api.RouterDistanceBetweenPairsResponse;
 import ca.bc.gov.ols.router.api.RouterDistanceResponse;
 import ca.bc.gov.ols.router.api.RouterOptimizedResponse;
 import ca.bc.gov.ols.router.api.RouterRouteResponse;
+import ca.bc.gov.ols.router.config.RouterConfig;
 import ca.bc.gov.ols.router.directions.Direction;
 import ca.bc.gov.ols.router.rest.messageconverters.ConverterHelper;
 import ca.bc.gov.ols.router.util.TimeHelper;
 
-import com.vividsolutions.jts.geom.CoordinateSequence;
-import com.vividsolutions.jts.geom.Geometry;
-import com.vividsolutions.jts.geom.Point;
+import org.locationtech.jts.geom.CoordinateSequence;
+import org.locationtech.jts.geom.Geometry;
+import org.locationtech.jts.geom.LineString;
+import org.locationtech.jts.geom.Point;
 
 public class HtmlConverterHelper extends ConverterHelper {
 	
@@ -132,13 +133,16 @@ public class HtmlConverterHelper extends ConverterHelper {
 
 	protected void writeFields(RouterRouteResponse response) throws IOException {
 		writeFields((RouterDistanceResponse)response);
-		
-		CoordinateSequence coords = response.getPath().getCoordinateSequence();
-		StringBuilder routeStr = new StringBuilder("<table>");
-		for(int i = 0; i < coords.size(); i++) {
-			routeStr.append("<tr><td>" + formatOrdinate(coords.getX(i)) + "</td><td>" + formatOrdinate(coords.getY(i)) + "</td></tr>");
+		LineString ls = response.getPath();
+		StringBuilder routeStr = new StringBuilder();
+		if(ls != null) {
+			routeStr.append("<table>");
+			CoordinateSequence coords = ls.getCoordinateSequence();
+			for(int i = 0; i < coords.size(); i++) {
+				routeStr.append("<tr><td>" + formatOrdinate(coords.getX(i)) + "</td><td>" + formatOrdinate(coords.getY(i)) + "</td></tr>");
+			}
+			routeStr.append("</table>");
 		}
-		routeStr.append("</table>");
 		writeField("route", routeStr, false);		
 	}
 	

@@ -39,4 +39,9 @@ local.properties
 .settings/
 .loadpath
 *.launch
+
+# IntelliJ
+
+.idea/
+
 node_modules/

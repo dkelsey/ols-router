@@ -11,17 +11,20 @@ import gnu.trove.procedure.TIntObjectProcedure;
 
 import java.io.IOException;
 import java.time.DayOfWeek;
+import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.EnumMap;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Set;
 
 import org.apache.commons.lang3.StringUtils;
 import org.onebusaway.gtfs.impl.GtfsDaoImpl;
@@ -32,33 +35,36 @@ import org.onebusaway.gtfs.model.Trip;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.vividsolutions.jts.geom.Coordinate;
-import com.vividsolutions.jts.geom.Envelope;
-import com.vividsolutions.jts.geom.Geometry;
-import com.vividsolutions.jts.geom.GeometryFactory;
-import com.vividsolutions.jts.geom.LineString;
-import com.vividsolutions.jts.geom.Point;
-import com.vividsolutions.jts.geom.PrecisionModel;
-import com.vividsolutions.jts.index.strtree.ItemBoundable;
-import com.vividsolutions.jts.index.strtree.ItemDistance;
-import com.vividsolutions.jts.index.strtree.STRtree;
-import com.vividsolutions.jts.linearref.LengthIndexedLine;
+import org.locationtech.jts.geom.Coordinate;
+import org.locationtech.jts.geom.Envelope;
+import org.locationtech.jts.geom.Geometry;
+import org.locationtech.jts.geom.GeometryFactory;
+import org.locationtech.jts.geom.LineString;
+import org.locationtech.jts.geom.Point;
+import org.locationtech.jts.geom.PrecisionModel;
+import org.locationtech.jts.index.strtree.ItemBoundable;
+import org.locationtech.jts.index.strtree.ItemDistance;
+import org.locationtech.jts.index.strtree.STRtree;
+import org.locationtech.jts.linearref.LengthIndexedLine;
 
-import ca.bc.gov.ols.router.RouterConfig;
+import ca.bc.gov.ols.enums.TravelDirection;
 import ca.bc.gov.ols.router.api.GeometryReprojector;
 import ca.bc.gov.ols.router.api.TurnRestrictionVis;
+import ca.bc.gov.ols.router.config.RouterConfig;
 import ca.bc.gov.ols.router.data.RoadClosureEvent;
 import ca.bc.gov.ols.router.data.RoadDelayEvent;
 import ca.bc.gov.ols.router.data.RoadEvent;
+import ca.bc.gov.ols.router.data.RoadTruckNoticeEvent;
 import ca.bc.gov.ols.router.data.StreetSegment;
-import ca.bc.gov.ols.router.data.TurnCost;
+import ca.bc.gov.ols.router.data.TurnClass;
+import ca.bc.gov.ols.router.data.TurnRestriction;
 import ca.bc.gov.ols.router.data.WeeklyTimeRange;
 import ca.bc.gov.ols.router.data.enums.NavInfoType;
-import ca.bc.gov.ols.router.data.enums.TravelDirection;
+import ca.bc.gov.ols.router.data.enums.TruckNoticeType;
+import ca.bc.gov.ols.router.data.enums.VehicleType;
 import ca.bc.gov.ols.router.data.vis.VisFeature;
 import ca.bc.gov.ols.router.data.vis.VisLayers;
 import ca.bc.gov.ols.router.data.vis.VisTurnRestriction;
-import ca.bc.gov.ols.router.datasources.RowReader;
 import ca.bc.gov.ols.router.engine.GraphBuilder;
 import ca.bc.gov.ols.router.open511.Event;
 import ca.bc.gov.ols.router.open511.EventResponse;
@@ -71,7 +77,8 @@ import ca.bc.gov.ols.router.time.TemporalSet;
 import ca.bc.gov.ols.router.time.TemporalSetIntersection;
 import ca.bc.gov.ols.router.time.TemporalSetUnion;
 import ca.bc.gov.ols.router.time.WeeklyDateRange;
-import ca.bc.gov.ols.router.util.IntObjectArrayMap;
+import ca.bc.gov.ols.rowreader.RowReader;
+import ca.bc.gov.ols.util.IntObjectArrayMap;
 
 public class BasicGraphBuilder implements GraphBuilder {
 	private static final Logger logger = LoggerFactory.getLogger(BasicGraphBuilder.class.getCanonicalName());
@@ -81,13 +88,15 @@ public class BasicGraphBuilder implements GraphBuilder {
 	private GeometryReprojector reprojector;
 	private TIntIntHashMap nodeIdByIntId;
 	private IntObjectArrayMap<int[]> edgeIdBySegId;
-	private TurnCostLookup turnCostLookup;
+	private TurnLookup turnLookup;
 	private TIntObjectMap<ArrayList<TurnRestrictionVis>> restrictionsByEdgeId;
 	private EventLookup eventLookup;
 	private TrafficLookupBuilder trafficLookupBuilder;
 	private VisLayers layers;
 	private List<Integer> ferryEdges;
 	private ScheduleLookup scheduleLookup;
+	TIntObjectMap<RoadTruckNoticeEvent> truckNoticeIdMap = new TIntObjectHashMap<RoadTruckNoticeEvent>();
+	TIntObjectMap<EnumMap<VehicleType,Double>> localDistortionField = new TIntObjectHashMap<EnumMap<VehicleType,Double>>();
 	
 	
 	public BasicGraphBuilder(RouterConfig config, GeometryReprojector reprojector) {
@@ -109,9 +118,11 @@ public class BasicGraphBuilder implements GraphBuilder {
 		int toIntId = seg.getEndIntersectionId();
 		int toNodeId = getNodeId(toIntId, ls.getEndPoint());
 		boolean oneWay = seg.getTravelDirection() != TravelDirection.BIDIRECTIONAL;
-		int[] edgeIds = graph.addEdge(fromNodeId, toNodeId, ls, oneWay, seg.getSpeedLimit(), seg.getName().intern(), 
-				seg.getStartTrafficImpactor(), seg.getEndTrafficImpactor(),
-				seg.getMaxHeight(), seg.getMaxWidth(), seg.getMaxWeight(), seg.isTruckRoute(), seg.isDeadEnded());
+		int[] edgeIds = graph.addEdge(fromNodeId, toNodeId, ls, oneWay, seg.getSpeedLimit(), 
+				seg.getLeftLocality().intern(), seg.getRightLocality().intern(), seg.getName().intern(), 
+				seg.getRoadClass(), seg.getStartTrafficImpactor(), seg.getEndTrafficImpactor(),
+				seg.getMaxHeight(), seg.getMaxWidth(), seg.getFromMaxWeight(), seg.getToMaxWeight(),
+				seg.isTruckRoute(), seg.getStartXingClass(), seg.getEndXingClass(), seg.isDeadEnded());
 		edgeIdBySegId.put(seg.getSegmentId(), edgeIds);
 		if(seg.isFerry()) {
 			for(int edgeId : edgeIds) {
@@ -121,12 +132,40 @@ public class BasicGraphBuilder implements GraphBuilder {
 	}
 
 	@Override
-	public void addTurnCost(TurnCost cost) {
-		if(turnCostLookup == null) {
-			turnCostLookup = new TurnCostLookup(graph);
+	public void addTurnRestriction(TurnRestriction tr) {
+		if(turnLookup == null) {
+			turnLookup = new TurnLookup(graph);
 		}
-		// need to convert from external data int/seg ids to internal graph node/edge ids
-		int[] oldIds = cost.getIdSeq();
+		int[] newIds = convertIds(tr.getIdSeq());
+		if(newIds == null) return;
+		
+		turnLookup.addRestriction(newIds, tr.getRestriction(), tr.getVehicleTypes());
+		
+		if(tr.getRestriction() != null) {			
+			ArrayList<TurnRestrictionVis> restrictionList = restrictionsByEdgeId.get(newIds[0]);
+			if(restrictionList == null) {
+				restrictionList = new ArrayList<TurnRestrictionVis>(3);
+				restrictionsByEdgeId.put(newIds[0], restrictionList);
+			}
+			TurnRestrictionVis trv = new TurnRestrictionVis(graph, newIds, tr.getRestriction()); 
+			restrictionList.add(trv);
+		}
+
+	}
+	
+	@Override
+	public void addTurnClass(TurnClass tc) {
+		if(turnLookup == null) {
+			turnLookup = new TurnLookup(graph);
+		}
+		int[] newIds = convertIds(tc.getIdSeq());
+		if(newIds == null) return;
+		
+		turnLookup.addClass(newIds, tc.getTurnDirection());
+	}
+
+	// converts from external data int/seg ids to internal graph node/edge ids
+	private int[] convertIds(int[] oldIds) {
 		int[] newIds = new int[oldIds.length];
 		int[] edgeIds = null;
 		for(int i = 0; i < oldIds.length; i++) {
@@ -136,37 +175,42 @@ public class BasicGraphBuilder implements GraphBuilder {
 				// we save them for now and then compare them against the nodeId to find the right one  
 				edgeIds = edgeIdBySegId.get(oldIds[i]);
 				if(edgeIds == null) {
-					logger.warn("Invalid segmentId in turn costs: {} (turn cost/restriction ignored)", oldIds[i]);
-					return;
+					logger.warn("Invalid segmentId in turn restrictions: {} (turn restriction ignored)", oldIds[i]);
+					return null;
 				}
 			} else {
 				// odd indexes are node Ids
 				Integer nodeId = nodeIdByIntId.get(oldIds[i]);
-				if(nodeId == nodeIdByIntId.getNoEntryKey()) {
-					nodeId = nodeIdByIntId.get(-oldIds[i]); // try the negative intId, for an overpass case
+				Integer	nodeIdOverpass = nodeIdByIntId.get(-oldIds[i]); // try the negative intId, for an overpass case
+				if(nodeId == nodeIdByIntId.getNoEntryValue() && nodeIdOverpass == nodeIdByIntId.getNoEntryValue()) {
+					logger.warn("Invalid intersectionId in turn restrictions: {} (turn restriction ignored)", oldIds[i]);
+					return null;
 				}
-				if(nodeId == nodeIdByIntId.getNoEntryKey()) {
-					logger.warn("Invalid intersectionId in turn costs: {} (turn cost/restriction ignored)", oldIds[i]);
-					return;
-				}
-				newIds[i] = nodeId;
 				// determine which segmentId to use for the previous segment
 				if(graph.getToNodeId(edgeIds[0]) == nodeId) {
+					newIds[i] = nodeId;
+					newIds[i-1] = edgeIds[0]; 
+				} else if(graph.getToNodeId(edgeIds[0]) == nodeIdOverpass) {
+					newIds[i] = nodeIdOverpass;
 					newIds[i-1] = edgeIds[0]; 
 				} else if(edgeIds.length > 1 && graph.getToNodeId(edgeIds[1]) == nodeId) {
+					newIds[i] = nodeId;
+					newIds[i-1] = edgeIds[1];
+				} else if(edgeIds.length > 1 && graph.getToNodeId(edgeIds[1]) == nodeIdOverpass) {
+					newIds[i] = nodeIdOverpass;
 					newIds[i-1] = edgeIds[1];
 				} else {
-					logger.warn("Invalid segment/intersectionId sequence in turn costs: {}|{} (turn cost/restriction ignored)", oldIds[i-1], oldIds[i]);
-					return;
+					logger.warn("Invalid segment/intersectionId sequence in turn restrictions: {}|{} (turn restriction ignored)", oldIds[i-1], oldIds[i]);
+					return null;
 				}
 			}
 		}
 		if(edgeIds == null) {
 			// shouldn't happen unless there was bad input
 			if(logger.isWarnEnabled()) {
-				logger.warn("Invalid Id sequence in turn costs: {} (turn cost/restriction ignored)", Arrays.toString(oldIds));
+				logger.warn("Invalid Id sequence in turn restrictions: {} (turn restriction ignored)", Arrays.toString(oldIds));
 			}
-			return;			
+			return null;			
 		}
 		// determine which segmentId to use for the last segment
 		int lastNodeId = newIds[newIds.length-2]; 
@@ -175,30 +219,12 @@ public class BasicGraphBuilder implements GraphBuilder {
 		} else if(edgeIds.length > 1 && graph.getFromNodeId(edgeIds[1]) == lastNodeId) {
 			newIds[newIds.length-1] = edgeIds[1];
 		} else {
-			logger.warn("Invalid intersectionId/segment sequence in turn costs: {}|{} (turn cost/restriction ignored)", oldIds[oldIds.length-2], oldIds[oldIds.length-1]);
-			return;
+			logger.warn("Invalid intersectionId/segment sequence in turn restrictions: {}|{} (turn restriction ignored)", oldIds[oldIds.length-2], oldIds[oldIds.length-1]);
+			return null;
 		}
-		
-		boolean result = turnCostLookup.addCost(newIds, cost.getCost(), cost.getRestriction());
-		if(!result) {
-			if(logger.isWarnEnabled()) {
-				logger.warn("Failed to add turn restriction for original Ids: {}", Arrays.toString(oldIds));
-			}
-			return;
-		}
-		
-		if(cost.getRestriction() != null) {			
-			ArrayList<TurnRestrictionVis> restrictionList = restrictionsByEdgeId.get(newIds[0]);
-			if(restrictionList == null) {
-				restrictionList = new ArrayList<TurnRestrictionVis>(3);
-				restrictionsByEdgeId.put(newIds[0], restrictionList);
-			}
-			TurnRestrictionVis tr = new TurnRestrictionVis(graph, newIds, cost.getRestriction()); 
-			restrictionList.add(tr);
-		}
-
+		return newIds;
 	}	
-	
+
 	@Override
 	public void addEvents(EventResponse eventResponse) {
 		if(eventLookup == null) {
@@ -244,14 +270,8 @@ public class BasicGraphBuilder implements GraphBuilder {
 					} else if(evt.getRoads().get(0).getDelay() != 0) {
 						roadEvent = new RoadDelayEvent(schedule, evt.getRoads().get(0).getDelay()*60);
 					}
-					List<Integer> edgeIds;
-					int otherEdgeId = graph.getOtherEdgeId(edgeId);
-					if(otherEdgeId == BasicGraph.NO_EDGE) {
-						edgeIds = Arrays.asList(edgeId); 
-					} else { 
-						edgeIds = Arrays.asList(edgeId, otherEdgeId);
-					}
-					eventLookup.addEvent(edgeIds, roadEvent);
+					eventLookup.addEvent(edgeId, roadEvent);
+					eventLookup.addEvent(graph.getOtherEdgeId(edgeId), roadEvent);
 					layers.addFeature(new VisFeature(geom, NavInfoType.EV, evt.getEventType().toString() + ": " + evt.getDescription()));
 				}
 			}
@@ -290,6 +310,7 @@ public class BasicGraphBuilder implements GraphBuilder {
 		// read the ITN_to_BCF file
 		// build a map from ferry route name to ferryInfo
 		Map<String,FerryInfo> ferryInfoByName = new HashMap<String,FerryInfo>();
+		Map<String,RoadTruckNoticeEvent> ferryTruckNoticeByName = new HashMap<String,RoadTruckNoticeEvent>();
 		while(mappingReader.next()) {
 			// use the seg ids and route name to identify the route and create it
 			String routeId = mappingReader.getString("route_id");
@@ -299,6 +320,17 @@ public class BasicGraphBuilder implements GraphBuilder {
 			boolean isScheduled = "y".equalsIgnoreCase(mappingReader.getString("is_scheduled"));
 			FerryInfo info = new FerryInfo(minWaitTime*60, travelTime*60, isScheduled);
 			ferryInfoByName.put(name, info);
+			
+			// read truck_notice_id and look it up and add it as an event
+			Integer truckNoticeId = mappingReader.getInteger("truck_notice_id");
+			if(truckNoticeId != null) {
+				RoadTruckNoticeEvent notice = truckNoticeIdMap.get(truckNoticeId);
+				if(notice == null) {
+					logger.warn("Ferry record refers to non-existent truck_notice id: {}", truckNoticeId);
+				} else {
+					ferryTruckNoticeByName.put(name, notice);
+				}
+			}
 		}
 		
 		// read the stops into a spatial index
@@ -349,6 +381,11 @@ public class BasicGraphBuilder implements GraphBuilder {
 			} else {
 				logger.warn("No ferry information assocated with ferry segment named: {}", name);
 			}
+			RoadTruckNoticeEvent notice = ferryTruckNoticeByName.get(name);
+			if(notice != null) {
+				eventLookup.addEvent(edgeId, notice);
+			}
+
 			LineString ferryLine = graph.getLineString(edgeId);
 			if(graph.getReversed(edgeId)) {
 				ferryLine = (LineString) ferryLine.reverse();
@@ -430,7 +467,66 @@ public class BasicGraphBuilder implements GraphBuilder {
 		double distance = startPoint.distance(reprojector.reproject(stopPoint, config.getBaseSrsCode()));
 		return distance <= 100;
 	}
-	
+
+	@Override
+	public void addTruckNotices(RowReader truckNoticeReader, RowReader truckNoticeMappingReader) {
+		while(truckNoticeReader.next()) {
+			int id = truckNoticeReader.getInt("TRUCK_NOTICE_ID");
+			TruckNoticeType type = TruckNoticeType.convert(truckNoticeReader.getString("TYPE"));
+			String description = truckNoticeReader.getString("DESCRIPTION");
+			LocalDate startDate = truckNoticeReader.getDate("START_DATE");
+			LocalDate endDate = truckNoticeReader.getDate("END_DATE");
+			TemporalSet dateRange = TemporalSet.ALWAYS;
+			if(startDate != null && endDate != null) {
+				dateRange = new DateInterval(startDate, endDate);
+			}
+			if(type != null && description != null && !description.isBlank()) {
+				RoadTruckNoticeEvent event = new RoadTruckNoticeEvent(dateRange, type, description);
+				truckNoticeIdMap.put(id, event);
+			} else {
+				logger.warn("Invalid Truck Notice ({},{},{})", id, type, description);
+			}
+		}
+
+		while(truckNoticeMappingReader.next()) {
+			int segId = truckNoticeMappingReader.getInt("STREET_SEGMENT_ID");
+			int noticeId = truckNoticeMappingReader.getInt("TRUCK_NOTICE_ID");
+			int[] edgeIds = edgeIdBySegId.get(segId);
+			if(edgeIds == null) {
+				logger.warn("truck notice mapping references unknown street_segment_id {}", segId);
+			} else {
+				for(int edgeId : edgeIds) {
+					eventLookup.addEvent(edgeId, truckNoticeIdMap.get(noticeId));
+				}
+			}
+		}
+	}
+
+	@Override
+	public void addLocalDistortionField(RowReader localDistortionFieldReader) {
+		while(localDistortionFieldReader.next()) {
+			int segId = localDistortionFieldReader.getInt("STREET_SEGMENT_ID");
+			Set<VehicleType> vehicleTypes = VehicleType.fromList(localDistortionFieldReader.getString("VEHICLE_TYPES"));
+			Double frictionFactor = localDistortionFieldReader.getDouble("FRICTION_FACTOR");
+			int[] edgeIds = edgeIdBySegId.get(segId);
+			if(edgeIds == null) {
+				logger.warn("local distortion field references unknown street_segment_id {}", segId);
+			} else {
+				for(int edgeId : edgeIds) {
+					EnumMap<VehicleType, Double> frictionFactors = localDistortionField.get(edgeId);
+					if(frictionFactors == null) {
+						frictionFactors = new EnumMap<VehicleType, Double>(VehicleType.class);
+						localDistortionField.put(edgeId, frictionFactors);
+					}
+					for(VehicleType type : vehicleTypes) {
+						frictionFactors.put(type, frictionFactor);
+					}
+				}
+			}
+			
+		}
+	}
+
 	private int addNode(int intId, Point point) {
 		int nodeId = graph.addNode(point);
 		nodeIdByIntId.put(intId, nodeId);
@@ -447,9 +543,10 @@ public class BasicGraphBuilder implements GraphBuilder {
 	
 	public BasicGraph build() {
 		graph.build();
-		graph.setTurnCostLookup(turnCostLookup);
+		graph.setTurnCostLookup(turnLookup);
 		graph.setEventLookup(eventLookup);
 		graph.setTrafficLookup(trafficLookupBuilder.build());
+		graph.setLocalDistortionField(localDistortionField);
 		buildTurnRestrictionLayer();
 		layers.buildIndexes();
 		graph.setVisLayers(layers);
